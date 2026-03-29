@@ -35,9 +35,9 @@ export function SearchBox({ onSearch, isSearching }: SearchBoxProps) {
     onDrop,
     maxFiles: 1,
     accept: {
-      'image/*': [],
-      'audio/*': [],
-      'video/*': [],
+      'image/*': ['.png', '.jpg', '.jpeg', '.webp', '.gif'],
+      'audio/*': ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.wma', '.webm'],
+      'video/*': ['.mp4', '.mov', '.mkv', '.webm', '.flv', '.mpeg', '.wmv', '.3gp'],
     },
   })
 
