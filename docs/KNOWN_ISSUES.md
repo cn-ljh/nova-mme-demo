@@ -26,9 +26,9 @@
 
 ---
 
-## KI-3: CloudFront Signed URLs Not Configured
+## KI-3: CloudFront Signed URLs Not Configured [RESOLVED]
 
-**Severity**: Medium (affects download URL security)
+**Severity**: ~~Medium~~ → RESOLVED (2026-03-29)
 
 **Description**: Content download URLs fall back to S3 presigned URLs (15-minute expiry, direct S3 domain) instead of CloudFront signed URLs (1-hour expiry, CloudFront domain).
 
@@ -42,6 +42,8 @@
 **Resolution options**:
 1. Replace `aws/s3` managed key with a customer-managed KMS key and add CloudFront OAC as a key user
 2. Or: Generate a CloudFront RSA key pair, store the private key in Secrets Manager, and pass the key pair ID as `CloudFrontKeyPairId` parameter on deploy
+
+**Resolution (2026-03-29)**: Changed S3 bucket encryption from `aws:kms` to `AES256` (SSE-S3). CloudFront OAC can now decrypt S3 objects without KMS key policy. CloudFront key pair configuration for signed URLs is still pending — content downloads still use S3 presigned URLs as fallback.
 
 ---
 

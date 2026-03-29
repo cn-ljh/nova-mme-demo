@@ -103,9 +103,6 @@ def _normalise_format(mime_type: Optional[str], s3_uri: str, default: str) -> st
         "x-ms-wmv": "wmv",
         "3gpp": "3gp",
         "mp3": "mp3",
-        "x-m4a": "mp4",
-        "m4a": "mp4",
-        "aac": "mp4",
     }
     return fmt_map.get(raw, raw)
 

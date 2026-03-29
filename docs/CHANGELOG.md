@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-03-29 — Bug Fixes: Audio Format & S3 Encryption
+
+### Fix: Remove Unsupported Audio Formats from Frontend
+
+**Problem**: Uploading `.m4a` files failed with Bedrock error `mp4 is not a valid enum value`. Frontend allowed m4a, aac, flac, webm audio formats but Nova MME Embedding only supports MP3, WAV, OGG.
+
+**Root cause**: Frontend `ACCEPTED_MIME_TYPES` included formats not supported by the Bedrock Nova Embedding API (`singleEmbeddingParams/audio/format`). The backend `_normalise_format()` mapped m4a/aac to `mp4`, which is not a valid audio format enum.
+
+**Fix**:
+- Frontend: narrowed audio accept list to `.mp3`, `.wav`, `.ogg` only
+- Backend: removed invalid m4a/aac format mappings from `bedrock_client.py`
+
+### Fix: S3 Bucket Encryption Changed from KMS to SSE-S3
+
+**Problem**: Amazon Transcribe `StartTranscriptionJob` failed with "The specified S3 bucket can't be accessed" when writing transcript output to ContentBucket.
+
+**Root cause**: ContentBucket used AWS-managed KMS encryption (`aws:kms`). Transcribe service cannot use AWS-managed KMS keys — you cannot add Transcribe as a key user on managed keys. The bucket policy granted `s3:GetObject/PutObject` to `transcribe.amazonaws.com`, but KMS decrypt/encrypt permissions were missing and cannot be granted for managed keys.
+
+**Fix**: Changed all S3 buckets from `SSEAlgorithm: aws:kms` to `SSEAlgorithm: AES256` (SSE-S3). This also resolves KI-3 (CloudFront OAC with KMS).
+
+**Impact**: Existing objects retain their original KMS encryption. New objects use SSE-S3. CloudFront OAC can now serve content directly without KMS key policy issues.
+
+---
+
 ## 2026-03-28 — Phase 2: Amazon Transcribe Integration
 
 ### Feature: Speech-to-Text Search for Audio/Video

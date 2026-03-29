@@ -5,7 +5,7 @@ import type { UploadState } from '@/types'
 
 const ACCEPTED_MIME_TYPES: Record<string, string[]> = {
   'image/*': ['.png', '.jpg', '.jpeg', '.webp', '.gif'],
-  'audio/*': ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.webm'],
+  'audio/*': ['.mp3', '.wav', '.ogg'],
   'video/*': ['.mp4', '.mov', '.mkv', '.webm', '.flv', '.mpeg', '.wmv', '.3gp'],
   'application/pdf': ['.pdf'],
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
