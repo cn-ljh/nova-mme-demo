@@ -148,13 +148,29 @@ export async function getDownloadUrl(contentId: string): Promise<string> {
 // Search endpoint
 // ============================================================
 
+const LARGE_FILE_THRESHOLD = 5 * 1024 * 1024 // 5MB
+
+export async function requestQueryUploadUrl(
+  filename: string,
+  mimeType: string,
+  fileSize: number,
+): Promise<{ uploadUrl: string; uploadFields: Record<string, string>; s3Key: string }> {
+  const res = await api.post('/api/content/query-upload', {
+    filename,
+    mime_type: mimeType,
+    file_size: fileSize,
+  })
+  return res.data
+}
+
 export async function search(params: {
   queryText?: string
   queryFile?: File
   topK?: number
   modalityFilter?: string[]
+  onStatus?: (msg: string) => void
 }): Promise<SearchResponse> {
-  let body: Record<string, unknown> = {
+  const body: Record<string, unknown> = {
     top_k: params.topK ?? 10,
   }
 
@@ -163,12 +179,27 @@ export async function search(params: {
   }
 
   if (params.queryFile) {
-    const arrayBuffer = await params.queryFile.arrayBuffer()
-    const base64 = btoa(
-      new Uint8Array(arrayBuffer).reduce((data, byte) => data + String.fromCharCode(byte), ''),
-    )
-    body.query_file = base64
-    body.query_file_type = params.queryFile.type
+    if (params.queryFile.size > LARGE_FILE_THRESHOLD) {
+      // Large file: upload to S3 via presigned URL to avoid API Gateway 10MB limit
+      params.onStatus?.('正在上传查询文件...')
+      const { uploadUrl, uploadFields, s3Key } = await requestQueryUploadUrl(
+        params.queryFile.name,
+        params.queryFile.type,
+        params.queryFile.size,
+      )
+      await uploadToS3(uploadUrl, uploadFields, params.queryFile)
+      body.query_s3_key = s3Key
+      body.query_file_type = params.queryFile.type
+      params.onStatus?.('正在生成查询向量...')
+    } else {
+      // Small file: encode as base64
+      const arrayBuffer = await params.queryFile.arrayBuffer()
+      const base64 = btoa(
+        new Uint8Array(arrayBuffer).reduce((data, byte) => data + String.fromCharCode(byte), ''),
+      )
+      body.query_file = base64
+      body.query_file_type = params.queryFile.type
+    }
   }
 
   if (params.modalityFilter?.length) {

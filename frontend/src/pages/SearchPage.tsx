@@ -10,6 +10,7 @@ export function SearchPage() {
     status: 'idle',
     results: [],
   })
+  const [statusLabel, setStatusLabel] = useState('生成查询向量并检索中...')
 
   const handleSearch = async (params: {
     queryText?: string
@@ -17,9 +18,13 @@ export function SearchPage() {
     topK: number
     modalityFilter: Modality[]
   }) => {
+    setStatusLabel('生成查询向量并检索中...')
     setState({ status: 'searching', results: [], errorMessage: undefined })
     try {
-      const resp = await search(params)
+      const resp = await search({
+        ...params,
+        onStatus: (msg) => setStatusLabel(msg),
+      })
       setState({
         status: 'done',
         results: resp.results,
@@ -47,7 +52,7 @@ export function SearchPage() {
 
       {status === 'searching' && (
         <div className="flex justify-center py-8">
-          <LoadingSpinner label="生成查询向量并检索中..." />
+          <LoadingSpinner label={statusLabel} />
         </div>
       )}
 

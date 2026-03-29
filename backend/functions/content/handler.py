@@ -53,6 +53,8 @@ def lambda_handler(event: dict, context: Any) -> dict:
             return _confirm_upload(event, user_id, request_id)
         elif path.endswith("/upload-text") and method == "POST":
             return _upload_text(event, user_id, request_id)
+        elif path.endswith("/query-upload") and method == "POST":
+            return _query_upload(event, user_id, request_id)
         elif "/download" in path and method == "GET":
             content_id = event.get("pathParameters", {}).get("content_id", "")
             return _get_download_url(content_id, user_id, request_id)
@@ -309,6 +311,44 @@ def _get_download_url(content_id: str, user_id: str, request_id: str) -> dict:
     )
 
     return api_response(200, {"download_url": url, "expires_in": expires_in})
+
+
+def _query_upload(event: dict, user_id: str, request_id: str) -> dict:
+    """Generate a presigned S3 POST URL for uploading a large query file (avoids 413 on search)."""
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return error_response(400, "Invalid JSON body", "INVALID_JSON", request_id=request_id)
+
+    filename = body.get("filename", "").strip()
+    mime_type = body.get("mime_type", "").strip()
+    file_size = int(body.get("file_size", 0))
+
+    if not filename or not mime_type or not file_size:
+        return error_response(400, "filename, mime_type, and file_size are required", "MISSING_FIELDS", request_id=request_id)
+
+    try:
+        modality = detect_modality(mime_type)
+        validate_file_size(modality, file_size)
+    except ValidationError as exc:
+        return error_response(400, exc.message, exc.error_code, details=exc.details, request_id=request_id)
+
+    ext = os.path.splitext(filename)[1]  # e.g. ".mp3"
+    s3_key = f"tmp/query/{user_id}/{uuid.uuid4()}{ext}"
+
+    presigned = generate_presigned_upload_url(
+        s3_key=s3_key,
+        mime_type=mime_type,
+        max_size_bytes=file_size,
+        expires_in=900,
+    )
+
+    logger.info("Query upload presigned URL generated", extra={"s3_key": s3_key})
+    return api_response(200, {
+        "upload_url": presigned["url"],
+        "upload_fields": presigned["fields"],
+        "s3_key": s3_key,
+    })
 
 
 def _enqueue_embedding(

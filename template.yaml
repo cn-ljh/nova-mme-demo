@@ -255,6 +255,12 @@ Resources:
             RestApiId: !Ref ApiGateway
             Path: /api/content/upload-text
             Method: POST
+        QueryUpload:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/content/query-upload
+            Method: POST
         GetContent:
           Type: Api
           Properties:
@@ -483,6 +489,10 @@ Resources:
               Action:
                 - secretsmanager:GetSecretValue
               Resource: !Ref CloudFrontPrivateKeySecret
+            - Effect: Allow
+              Action:
+                - s3:DeleteObject
+              Resource: !Sub "${ContentBucket.Arn}/tmp/query/*"
       Events:
         Search:
           Type: Api
@@ -627,6 +637,10 @@ Resources:
             Transitions:
               - TransitionInDays: 30
                 StorageClass: INTELLIGENT_TIERING
+          - Id: ExpireQueryTempFiles
+            Status: Enabled
+            Prefix: tmp/query/
+            ExpirationInDays: 1
 
   EmbeddingsOutputBucket:
     Type: AWS::S3::Bucket

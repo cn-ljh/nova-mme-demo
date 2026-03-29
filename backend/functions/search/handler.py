@@ -55,16 +55,17 @@ def _search(body: dict, user_id: str, request_id: str) -> dict:
     query_text: Optional[str] = body.get("query_text")
     query_file_b64: Optional[str] = body.get("query_file")  # base64-encoded file bytes
     query_file_type: Optional[str] = body.get("query_file_type")
+    query_s3_key: Optional[str] = body.get("query_s3_key")  # S3 key for large files
     top_k = int(body.get("top_k", DEFAULT_TOP_K))
     modality_filter: Optional[list] = body.get("modality_filter")
 
     # Validate top_k
     top_k = max(MIN_TOP_K, min(MAX_TOP_K, top_k))
 
-    if not query_text and not query_file_b64:
+    if not query_text and not query_file_b64 and not query_s3_key:
         return error_response(
             400,
-            "Either query_text or query_file (base64) must be provided",
+            "Either query_text, query_file (base64), or query_s3_key must be provided",
             "MISSING_QUERY",
             request_id=request_id,
         )
@@ -78,6 +79,7 @@ def _search(body: dict, user_id: str, request_id: str) -> dict:
             query_text=query_text,
             query_file_b64=query_file_b64,
             query_file_type=query_file_type,
+            query_s3_key=query_s3_key,
             modality_filter=modality_filter,
         )
     except ValidationError as exc:
@@ -250,6 +252,7 @@ def _generate_query_embedding(
     query_file_b64: Optional[str],
     query_file_type: Optional[str],
     modality_filter: Optional[list] = None,
+    query_s3_key: Optional[str] = None,
 ) -> list[float]:
     """Generate an embedding vector for the query input."""
     purpose = _get_embedding_purpose(modality_filter)
@@ -258,6 +261,30 @@ def _generate_query_embedding(
         validate_text_length(query_text)
         prefixed_text = _apply_text_query_prefix(query_text, modality_filter)
         return embed_text_sync(prefixed_text, embedding_purpose=purpose)
+
+    if query_s3_key:
+        # Large file already uploaded to S3 — use S3 URI directly (avoids loading into memory for audio/video)
+        from shared.s3_client import build_s3_uri, CONTENT_BUCKET
+        import boto3
+        mime_type = query_file_type or "application/octet-stream"
+        modality = detect_modality(mime_type)
+        s3_client = boto3.client("s3")
+        try:
+            if modality == "image":
+                obj = s3_client.get_object(Bucket=CONTENT_BUCKET, Key=query_s3_key)
+                file_bytes = obj["Body"].read()
+                validate_file_size(modality, len(file_bytes))
+                return embed_image_sync(file_bytes, mime_type, embedding_purpose=purpose)
+            elif modality in ("audio", "video"):
+                s3_uri = build_s3_uri(CONTENT_BUCKET, query_s3_key)
+                return embed_audio_video_sync(s3_uri, modality, embedding_purpose=purpose)
+            else:
+                raise ValidationError(f"Unsupported modality for query: {modality}", "UNSUPPORTED_QUERY_MODALITY")
+        finally:
+            try:
+                s3_client.delete_object(Bucket=CONTENT_BUCKET, Key=query_s3_key)
+            except Exception:
+                pass
 
     if query_file_b64:
         try:
@@ -272,14 +299,12 @@ def _generate_query_embedding(
         if modality == "image":
             return embed_image_sync(file_bytes, mime_type, embedding_purpose=purpose)
         elif modality in ("audio", "video"):
-            # For query files, we only support sync (≤100MB)
             from shared.s3_client import upload_bytes, build_s3_uri, CONTENT_BUCKET
             import uuid
             temp_key = f"tmp/query/{uuid.uuid4()}"
             upload_bytes(temp_key, file_bytes, mime_type)
             s3_uri = build_s3_uri(CONTENT_BUCKET, temp_key)
             result = embed_audio_video_sync(s3_uri, modality, embedding_purpose=purpose)
-            # Clean up temp file
             try:
                 import boto3
                 boto3.client("s3").delete_object(Bucket=CONTENT_BUCKET, Key=temp_key)
