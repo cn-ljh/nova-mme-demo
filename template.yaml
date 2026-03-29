@@ -1,0 +1,945 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Multimodal Content Retrieval Application
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment stage
+  CloudFrontKeyPairId:
+    Type: String
+    Default: ""
+    Description: CloudFront key pair ID for signed URLs (create in AWS console)
+  CloudFrontDomain:
+    Type: String
+    Default: ""
+    Description: CloudFront distribution domain name (set after first deploy to enable CF signed URLs)
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region for Bedrock Nova MME (check regional availability)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 512
+    Architectures: [arm64]
+    Layers:
+      - !Ref SharedLayer
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref ContentTable
+        CONTENT_BUCKET: !Ref ContentBucket
+        EMBEDDINGS_OUTPUT_BUCKET: !Ref EmbeddingsOutputBucket
+        EMBEDDING_QUEUE_URL: !Ref EmbeddingQueue
+        LARGE_FILE_EMBEDDING_QUEUE_URL: !Ref LargeFileEmbeddingQueue
+        VECTOR_BUCKET_NAME: !Sub "${AWS::StackName}-vectors-${Stage}"
+        VECTOR_INDEX_NAME: content-embeddings
+        BEDROCK_MODEL_ID: amazon.nova-2-multimodal-embeddings-v1:0
+        BEDROCK_REGION: !Ref BedrockRegion
+        STAGE: !Ref Stage
+        CLOUDFRONT_KEY_PAIR_ID: !Ref CloudFrontKeyPairId
+        CLOUDFRONT_PRIVATE_KEY_SECRET_ARN: !Ref CloudFrontPrivateKeySecret
+        CLOUDFRONT_DOMAIN: !Ref CloudFrontDomain
+        POWERTOOLS_SERVICE_NAME: multimodal-retrieval
+        LOG_LEVEL: INFO
+    Tracing: Active
+
+Resources:
+
+  # ============================================================
+  # Cognito User Pool
+  # ============================================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users-${Stage}"
+      UsernameConfiguration:
+        CaseSensitive: false
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      UserPoolAddOns:
+        AdvancedSecurityMode: AUDIT
+      DeletionProtection: !If [IsProd, ACTIVE, INACTIVE]
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-web-client-${Stage}"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH  # also allow for server-side auth Lambda
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 24
+      IdTokenValidity: 24
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      PreventUserExistenceErrors: ENABLED
+
+  # ============================================================
+  # API Gateway
+  # ============================================================
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api-${Stage}"
+      StageName: !Ref Stage
+      TracingEnabled: true
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"  # Lock down to CloudFront domain in production
+        MaxAge: "'600'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              Header: Authorization
+      BinaryMediaTypes:
+        - "multipart/form-data"
+        - "image/*"
+        - "audio/*"
+        - "video/*"
+        - "application/pdf"
+        - "application/octet-stream"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 1000
+          ThrottlingRateLimit: 100
+          LoggingLevel: ERROR
+          DataTraceEnabled: false
+          MetricsEnabled: true
+
+  # ============================================================
+  # Lambda Shared Layer
+  # ============================================================
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-shared-${Stage}"
+      Description: Shared utilities for all Lambda functions
+      ContentUri: backend/layers/shared/
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+    Metadata:
+      BuildMethod: python3.12
+
+  # ============================================================
+  # Auth Lambda
+  # ============================================================
+  AuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-auth-${Stage}"
+      CodeUri: backend/functions/auth/
+      Handler: handler.lambda_handler
+      Description: User registration and profile management
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminGetUser
+                - cognito-idp:SignUp
+                - cognito-idp:InitiateAuth
+              Resource: !GetAtt UserPool.Arn
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          USER_POOL_CLIENT_ID: !Ref UserPoolClient
+      Events:
+        Register:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/auth/register
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        Login:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/auth/login
+            Method: POST
+            Auth:
+              Authorizer: NONE
+        GetProfile:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/auth/me
+            Method: GET
+
+  # ============================================================
+  # Content Lambda
+  # ============================================================
+  ContentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-content-${Stage}"
+      CodeUri: backend/functions/content/
+      Handler: handler.lambda_handler
+      Timeout: 60
+      MemorySize: 1024
+      Description: File upload, presigned URL generation, content metadata management
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref ContentBucket
+        - S3ReadPolicy:
+            BucketName: !Ref ContentBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ContentTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt EmbeddingQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt LargeFileEmbeddingQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cloudfront:CreateInvalidation
+              Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/*"
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref CloudFrontPrivateKeySecret
+      Environment:
+        Variables:
+          SMALL_FILE_THRESHOLD_BYTES: "10485760"  # 10MB
+      Events:
+        RequestUploadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/content/request-upload
+            Method: POST
+        ConfirmUpload:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/content/confirm-upload
+            Method: POST
+        UploadText:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/content/upload-text
+            Method: POST
+        GetContent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/content/{content_id}
+            Method: GET
+        GetDownloadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/content/{content_id}/download
+            Method: GET
+
+  # ============================================================
+  # Embedding Lambda (processes SQS messages, handles small/large files)
+  # ============================================================
+  EmbeddingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-embedding-${Stage}"
+      CodeUri: backend/functions/embedding/
+      Handler: handler.lambda_handler
+      Timeout: 900  # 15 minutes max for sync Bedrock calls
+      MemorySize: 1024
+      Description: Generate embeddings via Bedrock Nova MME (sync for small files)
+      ReservedConcurrentExecutions: 10  # Limit concurrent Bedrock calls
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ContentBucket
+        - S3WritePolicy:
+            BucketName: !Ref EmbeddingsOutputBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ContentTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt EmbeddingQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:StartAsyncInvoke
+                - bedrock:GetAsyncInvoke
+              Resource:
+                - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/amazon.nova-2-multimodal-embeddings-v1:0"
+                - !Sub "arn:aws:bedrock:${BedrockRegion}:${AWS::AccountId}:async-invoke/*"
+            - Effect: Allow
+              Action:
+                - s3vectors:PutVectors
+                - s3vectors:GetVectors
+                - s3vectors:CreateVectorBucket
+                - s3vectors:CreateIndex
+                - s3vectors:ListVectorBuckets
+                - s3vectors:ListIndexes
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - s3vectors:PutVectors
+                - s3vectors:GetVectors
+              Resource: !Sub "arn:aws:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/${AWS::StackName}-vectors-${Stage}/index/content-embeddings"
+            - Effect: Allow
+              Action:
+                - transcribe:StartTranscriptionJob
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+              Resource: !GetAtt ContentTable.Arn
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EmbeddingQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  # Lambda for large files - starts async Bedrock job only (fast)
+  LargeFileEmbeddingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-embedding-large-${Stage}"
+      CodeUri: backend/functions/embedding/
+      Handler: handler.large_file_handler
+      Timeout: 60  # Only starts the async job, returns quickly
+      MemorySize: 512
+      Description: Start async Bedrock embedding for large files
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ContentBucket
+        - S3WritePolicy:
+            BucketName: !Ref EmbeddingsOutputBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ContentTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:StartAsyncInvoke
+                - bedrock:InvokeModel
+              Resource:
+                - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/amazon.nova-2-multimodal-embeddings-v1:0"
+                - !Sub "arn:aws:bedrock:${BedrockRegion}:${AWS::AccountId}:async-invoke/*"
+            - Effect: Allow
+              Action:
+                - transcribe:StartTranscriptionJob
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+              Resource: !GetAtt ContentTable.Arn
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt LargeFileEmbeddingQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  # ============================================================
+  # Embedding Poller Lambda (polls async Bedrock jobs)
+  # ============================================================
+  EmbeddingPollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-embedding-poller-${Stage}"
+      CodeUri: backend/functions/embedding_poller/
+      Handler: handler.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Description: Poll Bedrock async embedding jobs and store results to S3 Vectors
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref EmbeddingsOutputBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ContentTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:GetAsyncInvoke
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - s3vectors:PutVectors
+              Resource: !Sub "arn:aws:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/${AWS::StackName}-vectors-${Stage}/index/content-embeddings"
+      Events:
+        ScheduledPoll:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(1 minute)
+            Description: Poll pending async embedding jobs every minute
+            State: ENABLED
+
+  # ============================================================
+  # Transcribe Poller Lambda (polls Amazon Transcribe jobs, embeds transcripts)
+  # ============================================================
+  TranscribePollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-transcribe-poller-${Stage}"
+      CodeUri: backend/functions/transcribe_poller/
+      Handler: handler.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Description: Poll Transcribe jobs, generate text embeddings from transcripts, store in S3 Vectors
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ContentBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ContentTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - transcribe:GetTranscriptionJob
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/amazon.nova-2-multimodal-embeddings-v1:0"
+            - Effect: Allow
+              Action:
+                - s3vectors:PutVectors
+              Resource: !Sub "arn:aws:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/${AWS::StackName}-vectors-${Stage}/index/content-embeddings"
+      Events:
+        ScheduledPoll:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(1 minute)
+            Description: Poll pending Transcribe jobs and embed completed transcripts every minute
+            State: ENABLED
+
+  TranscribePollerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${TranscribePollerFunction}"
+      RetentionInDays: 30
+
+  # ============================================================
+  # Search Lambda
+  # ============================================================
+  SearchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-search-${Stage}"
+      CodeUri: backend/functions/search/
+      Handler: handler.lambda_handler
+      Timeout: 60
+      MemorySize: 512
+      Description: Convert query to embedding and search S3 Vectors
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ContentTable
+        - S3ReadPolicy:
+            BucketName: !Ref ContentBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/amazon.nova-2-multimodal-embeddings-v1:0"
+            - Effect: Allow
+              Action:
+                - s3vectors:QueryVectors
+                - s3vectors:GetVectors
+              Resource: !Sub "arn:aws:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/${AWS::StackName}-vectors-${Stage}/index/content-embeddings"
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref CloudFrontPrivateKeySecret
+      Events:
+        Search:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/search
+            Method: POST
+
+  # ============================================================
+  # Task Lambda
+  # ============================================================
+  TaskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-task-${Stage}"
+      CodeUri: backend/functions/task/
+      Handler: handler.lambda_handler
+      Description: Task status management and querying
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ContentTable
+      Events:
+        ListTasks:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/tasks
+            Method: GET
+        GetTask:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /api/tasks/{task_id}
+            Method: GET
+
+  # ============================================================
+  # Vector Bucket Setup (Custom Resource)
+  # ============================================================
+  EmbeddingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-embedding-dlq-${Stage}"
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+
+  EmbeddingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-embedding-${Stage}"
+      VisibilityTimeout: 960  # > Lambda timeout (900s) + buffer
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EmbeddingDLQ.Arn
+        maxReceiveCount: 4
+      KmsMasterKeyId: alias/aws/sqs
+
+  LargeFileEmbeddingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-embedding-large-dlq-${Stage}"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  LargeFileEmbeddingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-embedding-large-${Stage}"
+      VisibilityTimeout: 60  # Large file handler is fast (just starts async job)
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt LargeFileEmbeddingDLQ.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs
+
+  # ============================================================
+  # DynamoDB Table (Single Table Design)
+  # ============================================================
+  ContentTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: !If [IsProd, Retain, Delete]
+    Properties:
+      TableName: !Sub "${AWS::StackName}-content-${Stage}"
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # ============================================================
+  # S3 Buckets
+  # ============================================================
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-content-${Stage}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: [GET, PUT, POST, HEAD]
+            AllowedOrigins: ["*"]  # Lock to CloudFront domain in prod
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: IntelligentTiering
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: INTELLIGENT_TIERING
+
+  EmbeddingsOutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-embeddings-output-${Stage}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Allow Bedrock to write async invocation results
+      # (Bucket policy added separately - Bedrock needs specific permissions)
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireEmbeddingOutputs
+            Status: Enabled
+            ExpirationInDays: 7
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-frontend-${Stage}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Allow CloudFront OAC to read frontend bucket
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # Allow CloudFront OAC to read content bucket (for signed URL delivery)
+  ContentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${ContentBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+          - Sid: AllowBedrockAsyncOutput
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Sub "${ContentBucket.Arn}/*"
+          - Sid: AllowTranscribeReadWrite
+            Effect: Allow
+            Principal:
+              Service: transcribe.amazonaws.com
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub "${ContentBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ============================================================
+  # CloudFront
+  # ============================================================
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-frontend-oac-${Stage}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ContentOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-content-oac-${Stage}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # CloudFront Function: strip /content prefix before forwarding to S3
+  # CloudFront URL path: /content/uploads/user/id/file
+  # S3 object key:               uploads/user/id/file
+  ContentPathRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${AWS::StackName}-content-path-rewrite-${Stage}"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Strip /content prefix so S3 receives the correct object key
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          request.uri = request.uri.replace(/^\/content/, '');
+          if (!request.uri || request.uri === '') {
+            request.uri = '/';
+          }
+          return request;
+        }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${AWS::StackName} - ${Stage}"
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Origins:
+          - Id: FrontendOrigin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+          - Id: ApiOrigin
+            DomainName: !Sub "${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+            OriginPath: !Sub "/${Stage}"
+          - Id: ContentOrigin
+            DomainName: !GetAtt ContentBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt ContentOAC.Id
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: https-only
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+            AllowedMethods: [DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT]
+            Compress: false
+          - PathPattern: /content/*
+            TargetOriginId: ContentOrigin
+            ViewerProtocolPolicy: https-only
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+            AllowedMethods: [GET, HEAD]
+            TrustedKeyGroups:
+              - !If [HasKeyPair, !Ref CloudFrontKeyGroup, !Ref AWS::NoValue]
+            FunctionAssociations:
+              - EventType: viewer-request
+                FunctionARN: !GetAtt ContentPathRewriteFunction.FunctionMetadata.FunctionARN
+            Compress: false
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html  # SPA routing
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  # CloudFront Key Group for signed URLs (requires key pair created in console)
+  CloudFrontKeyGroup:
+    Type: AWS::CloudFront::KeyGroup
+    Condition: HasKeyPair
+    Properties:
+      KeyGroupConfig:
+        Name: !Sub "${AWS::StackName}-key-group-${Stage}"
+        Items:
+          - !Ref CloudFrontKeyPairId
+
+  # ============================================================
+  # Secrets Manager
+  # ============================================================
+  CloudFrontPrivateKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/cloudfront-private-key/${Stage}"
+      Description: CloudFront private key for signed URL generation
+      # Actual private key value must be set manually after deployment
+      SecretString: '{"private_key": "REPLACE_WITH_ACTUAL_PRIVATE_KEY"}'
+      KmsKeyId: alias/aws/secretsmanager
+
+  # ============================================================
+  # CloudWatch Log Groups
+  # ============================================================
+  AuthFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AuthFunction}"
+      RetentionInDays: 30
+
+  ContentFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ContentFunction}"
+      RetentionInDays: 30
+
+  EmbeddingFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${EmbeddingFunction}"
+      RetentionInDays: 30
+
+  SearchFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SearchFunction}"
+      RetentionInDays: 30
+
+  TaskFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${TaskFunction}"
+      RetentionInDays: 30
+
+  # CloudWatch Alarm: DLQ depth
+  EmbeddingDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-embedding-dlq-depth-${Stage}"
+      AlarmDescription: Embedding DLQ has messages - check for processing failures
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EmbeddingDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Conditions:
+  IsProd: !Equals [!Ref Stage, prod]
+  HasKeyPair: !Not [!Equals [!Ref CloudFrontKeyPairId, ""]]
+
+Outputs:
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiUrl"
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain
+    Value: !Sub "https://${Distribution.DomainName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDomain"
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolId"
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolClientId"
+
+  ContentBucketName:
+    Description: S3 Content Bucket
+    Value: !Ref ContentBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ContentBucket"
+
+  FrontendBucketName:
+    Description: S3 Frontend Bucket
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-FrontendBucket"
+
+  VectorBucketName:
+    Description: S3 Vectors Bucket Name
+    Value: !Sub "${AWS::StackName}-vectors-${Stage}"
+    Export:
+      Name: !Sub "${AWS::StackName}-VectorBucket"
+
+  ContentTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref ContentTable
+    Export:
+      Name: !Sub "${AWS::StackName}-ContentTable"

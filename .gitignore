@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+*.pyc
+
+# SAM / AWS
+.aws-sam/
+samconfig.toml
+*.zip
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+.coverage
+
+# Secrets
+*.pem
+*.key
+*.p8
+secrets/

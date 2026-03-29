@@ -1,0 +1,17 @@
+# samconfig.toml.example
+# Copy this file to samconfig.toml and fill in your values.
+# samconfig.toml is in .gitignore and should NOT be committed.
+
+version = 0.1
+
+[default.build.parameters]
+parallel = true
+
+[default.deploy.parameters]
+stack_name = "multimodal-retrieval-dev"
+s3_bucket = "<YOUR_SAM_ARTIFACTS_BUCKET>"
+s3_prefix = "multimodal-retrieval"
+region = "<YOUR_REGION>"
+confirm_changeset = false
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND"
+parameter_overrides = "Stage=dev CloudFrontDomain=<YOUR_CLOUDFRONT_DOMAIN>"
