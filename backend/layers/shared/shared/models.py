@@ -19,6 +19,12 @@ SUPPORTED_MIME_TYPES: dict[str, str] = {
     "audio/ogg": "audio",
     "audio/x-wav": "audio",
     "audio/mp3": "audio",
+    "audio/x-m4a": "audio",
+    "audio/m4a": "audio",
+    "audio/aac": "audio",
+    "audio/flac": "audio",
+    "audio/x-flac": "audio",
+    "audio/webm": "audio",
     # Video
     "video/mp4": "video",
     "video/quicktime": "video",
