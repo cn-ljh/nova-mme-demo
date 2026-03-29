@@ -29,6 +29,8 @@ Upload flow:
 
 Full architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
+![Architecture Diagram](docs/nova-mme-architecture.png)
+
 ## Supported Formats
 
 | Modality | Formats | Limit |

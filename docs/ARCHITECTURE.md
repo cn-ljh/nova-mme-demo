@@ -6,6 +6,9 @@ A serverless multimodal content retrieval system built on AWS. Users upload text
 
 ## System Architecture
 
+![Architecture Diagram](nova-mme-architecture.png)
+
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         Users (Browser)                          │
