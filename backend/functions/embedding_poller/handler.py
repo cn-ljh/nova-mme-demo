@@ -49,6 +49,8 @@ def lambda_handler(event: dict, context: Any) -> dict:
         invocation_arn = data.get("async_invocation_arn", "")
         modality = data.get("modality", "")
         segment_duration_seconds = data.get("segment_duration_seconds")
+        if segment_duration_seconds is not None:
+            segment_duration_seconds = int(segment_duration_seconds)
 
         if not invocation_arn:
             continue
