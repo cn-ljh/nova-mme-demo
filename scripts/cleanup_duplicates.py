@@ -1,92 +1,140 @@
 #!/usr/bin/env python3
-"""Clean up duplicate content records, S3 files, S3 Vectors, and Transcribe jobs."""
+"""Clean up duplicate content records, S3 files, S3 Vectors, and Transcribe jobs.
+
+Usage:
+  python3 scripts/cleanup_duplicates.py                # dry-run
+  python3 scripts/cleanup_duplicates.py --execute      # actually delete
+
+Requires env vars or samconfig for:
+  DDB_TABLE, S3_BUCKET, VECTOR_BUCKET, VECTOR_INDEX
+Or reads from CloudFormation stack outputs automatically.
+"""
 import argparse
+import os
 import boto3
 from botocore.exceptions import ClientError
 
-DDB_TABLE = "multimodal-retrieval-dev-content-dev"
-S3_BUCKET = "multimodal-retrieval-dev-content-dev-778346837945"
-VECTOR_BUCKET = "multimodal-retrieval-dev-vectors-dev"
-VECTOR_INDEX = "content-embeddings"
-USER_ID = "a8b1d300-d0d1-7066-0eb6-e58366f15504"
-REGION = "us-west-2"
 
-DUPLICATES = [
-    {"content_id": "ed09daaf-5b83-4586-b041-e4ac7866135d", "filename": "Agentic AI.pdf", "keep_id": "9c706517"},
-    {"content_id": "c6f361a3-7091-41fa-b4ee-cfb9643a1255", "filename": "image.png", "keep_id": "9c6fa50c"},
-    {"content_id": "fdbe0ee6-f19f-4c15-aa2a-e2ca32331b9f", "filename": "xqy02日耳曼.mp3", "keep_id": "f1efb3f9"},
-]
+def get_stack_config(stack_name="multimodal-retrieval-dev", region="us-west-2"):
+    """Read resource names from CloudFormation stack outputs."""
+    cfn = boto3.client("cloudformation", region_name=region)
+    try:
+        resp = cfn.describe_stacks(StackName=stack_name)
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in resp["Stacks"][0].get("Outputs", [])}
+        return {
+            "DDB_TABLE": outputs.get("ContentTableName", ""),
+            "S3_BUCKET": outputs.get("ContentBucketName", ""),
+            "VECTOR_BUCKET": outputs.get("VectorBucketName", ""),
+            "VECTOR_INDEX": "content-embeddings",
+        }
+    except Exception as e:
+        print(f"Warning: could not read stack outputs: {e}")
+        return {}
 
 
-def find_vector_keys(s3v, content_id):
+def find_vector_keys(s3v, vector_bucket, vector_index, content_id):
     """Probe for all vectors belonging to a content_id."""
-    keys_to_try = []
-    for i in range(50):
-        keys_to_try.append(f"{content_id}#seg{i}")
-    for i in range(30):
-        keys_to_try.append(f"{content_id}#transcript#seg{i}")
-    
+    keys_to_try = [f"{content_id}#seg{i}" for i in range(50)]
+    keys_to_try += [f"{content_id}#transcript#seg{i}" for i in range(30)]
     resp = s3v.get_vectors(
-        vectorBucketName=VECTOR_BUCKET, indexName=VECTOR_INDEX,
+        vectorBucketName=vector_bucket, indexName=vector_index,
         keys=keys_to_try, returnMetadata=False,
     )
     return [v["key"] for v in resp.get("vectors", [])]
 
 
-def cleanup(execute):
-    ddb = boto3.resource("dynamodb", region_name=REGION)
-    table = ddb.Table(DDB_TABLE)
-    s3 = boto3.client("s3", region_name=REGION)
-    s3v = boto3.client("s3vectors", region_name=REGION)
-    transcribe = boto3.client("transcribe", region_name=REGION)
+def scan_duplicates(table):
+    """Find duplicate content (same filename+file_size) in the table."""
+    from collections import defaultdict
+    resp = table.scan()
+    by_key = defaultdict(list)
+    for item in resp["Items"]:
+        if item.get("entity_type") != "CONTENT":
+            continue
+        data = item.get("data", {})
+        key = (data.get("filename"), int(data.get("file_size", 0)))
+        user_id = item["PK"].replace("USER#", "")
+        content_id = item["SK"].replace("CONTENT#", "")
+        by_key[key].append({"content_id": content_id, "user_id": user_id, "item": item})
+    return {k: v for k, v in by_key.items() if len(v) > 1}
+
+
+def cleanup(execute, region="us-west-2"):
+    config = get_stack_config(region=region)
+    ddb_table = os.environ.get("DDB_TABLE", config.get("DDB_TABLE", ""))
+    s3_bucket = os.environ.get("S3_BUCKET", config.get("S3_BUCKET", ""))
+    vector_bucket = os.environ.get("VECTOR_BUCKET", config.get("VECTOR_BUCKET", ""))
+    vector_index = os.environ.get("VECTOR_INDEX", config.get("VECTOR_INDEX", "content-embeddings"))
+
+    if not all([ddb_table, s3_bucket, vector_bucket]):
+        print("Error: could not determine resource names. Set DDB_TABLE, S3_BUCKET, VECTOR_BUCKET env vars.")
+        return
+
+    ddb = boto3.resource("dynamodb", region_name=region)
+    table = ddb.Table(ddb_table)
+    s3 = boto3.client("s3", region_name=region)
+    s3v = boto3.client("s3vectors", region_name=region)
+    transcribe = boto3.client("transcribe", region_name=region)
 
     mode = "🔴 EXECUTE" if execute else "🟡 DRY-RUN"
-    print(f"=== {mode} ===\n")
+    print(f"=== {mode} ===")
+    print(f"Table: {ddb_table} | Bucket: {s3_bucket} | Vectors: {vector_bucket}/{vector_index}\n")
 
-    for dup in DUPLICATES:
-        cid = dup["content_id"]
-        print(f"--- {dup['filename']} (delete {cid[:8]}..., keep {dup['keep_id']}) ---")
+    duplicates = scan_duplicates(table)
+    if not duplicates:
+        print("✅ No duplicates found!")
+        return
 
-        # 1. DDB content
-        ck = {"PK": f"USER#{USER_ID}", "SK": f"CONTENT#{cid}"}
-        print(f"  [DDB] Content record")
-        if execute: table.delete_item(Key=ck); print("    ✓")
+    print(f"Found {len(duplicates)} duplicate group(s):\n")
 
-        # 2. DDB embedding
-        ek = {"PK": f"CONTENT#{cid}", "SK": "EMBEDDING"}
-        print(f"  [DDB] Embedding record")
-        if execute: table.delete_item(Key=ek); print("    ✓")
+    for (filename, file_size), entries in duplicates.items():
+        print(f"--- {filename} ({file_size} bytes, {len(entries)} copies) ---")
+        # Keep first, delete rest
+        keep = entries[0]
+        to_delete = entries[1:]
+        print(f"  KEEP: {keep['content_id'][:12]}...")
 
-        # 3. S3 files
-        prefix = f"uploads/{USER_ID}/{cid}/"
-        objs = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix).get("Contents", [])
-        print(f"  [S3]  {len(objs)} file(s) under {prefix[:40]}...")
-        for o in objs:
-            print(f"    - {o['Key'].split('/')[-1]} ({o['Size']} bytes)")
-            if execute: s3.delete_object(Bucket=S3_BUCKET, Key=o["Key"]); print("      ✓")
+        for dup in to_delete:
+            cid = dup["content_id"]
+            uid = dup["user_id"]
+            print(f"  DELETE: {cid[:12]}...")
 
-        # 4. S3 Vectors
-        vkeys = find_vector_keys(s3v, cid)
-        print(f"  [S3V] {len(vkeys)} vectors")
-        if execute and vkeys:
-            s3v.delete_vectors(vectorBucketName=VECTOR_BUCKET, indexName=VECTOR_INDEX, keys=vkeys)
-            print(f"    ✓ Deleted {len(vkeys)}")
+            # DDB
+            for key in [
+                {"PK": f"USER#{uid}", "SK": f"CONTENT#{cid}"},
+                {"PK": f"CONTENT#{cid}", "SK": "EMBEDDING"},
+            ]:
+                print(f"    [DDB] {key['SK']}")
+                if execute:
+                    table.delete_item(Key=key)
+                    print(f"      ✓")
 
-        # 5. Transcribe job
-        job_name = f"mmr-{cid}"[:40]
-        try:
-            transcribe.get_transcription_job(TranscriptionJobName=job_name)
-            print(f"  [Transcribe] Job found: {job_name}")
-            if execute: transcribe.delete_transcription_job(TranscriptionJobName=job_name); print("    ✓")
-        except Exception:
-            print(f"  [Transcribe] No job")
+            # S3
+            prefix = f"uploads/{uid}/{cid}/"
+            objs = s3.list_objects_v2(Bucket=s3_bucket, Prefix=prefix).get("Contents", [])
+            print(f"    [S3]  {len(objs)} file(s)")
+            if execute:
+                for o in objs:
+                    s3.delete_object(Bucket=s3_bucket, Key=o["Key"])
+                print(f"      ✓")
 
-        # 6. Transcribe output in S3
-        t_objs = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f"transcribe-output/{cid}").get("Contents", [])
-        if t_objs:
-            print(f"  [S3]  {len(t_objs)} transcribe output file(s)")
-            for o in t_objs:
-                if execute: s3.delete_object(Bucket=S3_BUCKET, Key=o["Key"]); print(f"    ✓ {o['Key'].split('/')[-1]}")
+            # Vectors
+            vkeys = find_vector_keys(s3v, vector_bucket, vector_index, cid)
+            print(f"    [S3V] {len(vkeys)} vectors")
+            if execute and vkeys:
+                s3v.delete_vectors(vectorBucketName=vector_bucket, indexName=vector_index, keys=vkeys)
+                print(f"      ✓")
+
+            # Transcribe
+            job_name = f"mmr-{cid}"[:40]
+            try:
+                transcribe.get_transcription_job(TranscriptionJobName=job_name)
+                print(f"    [Transcribe] Job: {job_name}")
+                if execute:
+                    transcribe.delete_transcription_job(TranscriptionJobName=job_name)
+                    print(f"      ✓")
+            except Exception:
+                pass
 
         print()
 
@@ -94,6 +142,7 @@ def cleanup(execute):
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--execute", action="store_true")
-    cleanup(p.parse_args().execute)
+    p = argparse.ArgumentParser(description="Find and clean duplicate content")
+    p.add_argument("--execute", action="store_true", help="Actually delete (default: dry-run)")
+    p.add_argument("--region", default="us-west-2")
+    cleanup(p.parse_args().execute, p.parse_args().region)
