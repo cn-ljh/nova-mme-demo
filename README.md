@@ -1,5 +1,7 @@
 # Nova MME Demo — Multimodal Content Retrieval
 
+**English** | [中文](README_CN.md)
+
 A serverless AWS application for uploading and semantically searching multimodal content — text, images, audio, video, and documents — using a unified 1024-dimensional vector embedding space.
 
 **Core technology stack**:
