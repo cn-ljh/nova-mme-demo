@@ -258,3 +258,25 @@ def get_pending_transcribe_content(limit: int = 50) -> list[dict]:
         Limit=limit,
     )
     return response.get("Items", [])
+
+
+# ============================================================
+# Duplicate detection
+# ============================================================
+
+def find_duplicate_content(user_id: str, filename: str, file_size: int) -> Optional[dict]:
+    """Check if a content record with the same filename and file_size already exists for this user.
+    Returns the existing content item if found, None otherwise.
+    """
+    response = _table().query(
+        KeyConditionExpression=Key("PK").eq(user_pk(user_id)) & Key("SK").begins_with("CONTENT#"),
+        FilterExpression=Attr("data.filename").eq(filename) & Attr("data.file_size").eq(file_size),
+    )
+    items = response.get("Items", [])
+    if items:
+        logger.info("Duplicate content found", extra={
+            "filename": filename, "file_size": file_size,
+            "existing_content_id": items[0]["SK"].replace("CONTENT#", ""),
+        })
+        return items[0]
+    return None

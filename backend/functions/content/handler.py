@@ -15,7 +15,7 @@ from shared.models import (
     ContentItem, TaskItem, should_use_async_api,
     SUPPORTED_MIME_TYPES, SIZE_LIMITS, MAX_TEXT_CHARS,
 )
-from shared.dynamodb import put_content, put_task, get_content_by_id, now_iso
+from shared.dynamodb import put_content, put_task, get_content_by_id, now_iso, find_duplicate_content
 from shared.s3_client import (
     generate_presigned_upload_url, upload_bytes,
     build_content_s3_key, build_s3_uri, get_presigned_download_url,
@@ -84,6 +84,16 @@ def _request_upload(event: dict, user_id: str, request_id: str) -> dict:
         validate_file_size(modality, file_size)
     except ValidationError as exc:
         return error_response(400, exc.message, exc.error_code, details=exc.details, request_id=request_id)
+
+    # Check for duplicate content (same filename + file_size for this user)
+    existing = find_duplicate_content(user_id, filename, file_size)
+    if existing:
+        existing_id = existing["SK"].replace("CONTENT#", "")
+        logger.info("Duplicate upload detected at request stage", extra={
+            "filename": filename, "file_size": file_size, "existing_content_id": existing_id,
+        })
+        return error_response(409, f"Duplicate content: a file with the same name and size already exists (content_id: {existing_id})",
+                              "DUPLICATE_CONTENT", details={"existing_content_id": existing_id}, request_id=request_id)
 
     content_id = str(uuid.uuid4())
     s3_key = build_content_s3_key(user_id, content_id, filename)
